@@ -130,7 +130,80 @@ app.post('/api/summarize-chat', async (req, res) => {
 });
 
 
-// 4. Bật công tắc cho Server chạy
+
+// Tinh nang 3: AI Assistant chat tong quat
+app.post('/api/assistant/chat', async (req, res) => {
+  try {
+    const { userMessage, projectId, context } = req.body;
+
+    if (!userMessage || typeof userMessage !== 'string') {
+      return res.status(400).json({ error: 'Vui long cung cap userMessage' });
+    }
+
+    const safeContext = context || {};
+    const contextText = JSON.stringify(safeContext, null, 2);
+
+    const aiPrompt = `
+      Ban la tro ly ao AI cua ung dung quan ly cong viec TaskHub.
+      Hay tra loi ngan gon, ro rang, uu tien hanh dong cu the cho quan ly du an.
+
+      Project ID: ${projectId || 'khong co'}
+
+      Ngu canh hien tai cua ung dung:
+      ${contextText}
+
+      Cau hoi cua nguoi dung:
+      ${userMessage}
+
+      QUAN TRONG: Chi tra ve mot JSON object hop le, khong markdown, khong giai thich ngoai JSON.
+      Cau truc:
+      {
+        "reply": "Noi dung tra loi bang tieng Viet",
+        "suggestedActions": ["CREATE_TASK", "SUMMARIZE"]
+      }
+
+      suggestedActions chi duoc chon tu: CREATE_TASK, SUMMARIZE, FIND_TASK, PRIORITIZE.
+      Neu khong can goi y hanh dong thi tra ve mang rong.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: aiPrompt,
+    });
+
+    let rawText = response.text || '';
+    const startIndex = rawText.indexOf('{');
+    const endIndex = rawText.lastIndexOf('}');
+
+    if (startIndex !== -1 && endIndex !== -1) {
+      rawText = rawText.substring(startIndex, endIndex + 1);
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (parseError) {
+      parsed = {
+        reply: response.text || 'Toi chua tao duoc cau tra loi phu hop.',
+        suggestedActions: [],
+      };
+    }
+
+    res.json({
+      reply: parsed.reply || 'Toi chua tao duoc cau tra loi phu hop.',
+      suggestedActions: Array.isArray(parsed.suggestedActions)
+        ? parsed.suggestedActions
+        : [],
+    });
+  } catch (error) {
+    console.error('Assistant error:', error);
+    res.status(500).json({
+      error: 'Tro ly AI dang ban, vui long thu lai sau!',
+      details: error.message,
+    });
+  }
+});
+// 4. Bat cong tac cho Server chay
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n=========================================`);
