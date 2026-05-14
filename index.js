@@ -131,78 +131,65 @@ app.post('/api/summarize-chat', async (req, res) => {
 
 
 
-// Tinh nang 3: AI Assistant chat tong quat
+// Tính năng Trợ lý AI Thông minh (AI Assistant Hub)
 app.post('/api/assistant/chat', async (req, res) => {
   try {
     const { userMessage, projectId, context } = req.body;
 
-    if (!userMessage || typeof userMessage !== 'string') {
-      return res.status(400).json({ error: 'Vui long cung cap userMessage' });
+    if (!userMessage) {
+      return res.status(400).json({ error: 'Vui lòng cung cấp tin nhắn.' });
     }
 
-    const safeContext = context || {};
-    const contextText = JSON.stringify(safeContext, null, 2);
+    // 1. Ép kiểu Context thành dạng dễ đọc để AI phân tích
+    const contextString = context && Object.keys(context).length > 0 
+      ? JSON.stringify(context, null, 2) 
+      : 'Người dùng chưa cung cấp dữ liệu dự án.';
 
-    const aiPrompt = `
-      Ban la tro ly ao AI cua ung dung quan ly cong viec TaskHub.
-      Hay tra loi ngan gon, ro rang, uu tien hanh dong cu the cho quan ly du an.
+    // 2. Thiết lập "Nhân cách" và "Luật lệ" cho Trợ lý (System Instruction)
+    const systemInstruction = `Bạn là TaskHub AI, một trợ lý quản lý dự án thông minh, chuyên nghiệp và tận tâm.
+Nhiệm vụ của bạn là giúp người dùng quản lý công việc, phân tích tiến độ, và đưa ra lời khuyên.
 
-      Project ID: ${projectId || 'khong co'}
+DỮ LIỆU DỰ ÁN HIỆN TẠI CỦA NGƯỜI DÙNG:
+${contextString}
 
-      Ngu canh hien tai cua ung dung:
-      ${contextText}
+QUY TẮC PHẢN HỒI (BẮT BUỘC TUÂN THỦ):
+1. Phân tích câu hỏi của người dùng và đối chiếu với "Dữ liệu dự án" để đưa ra câu trả lời chính xác, thực tế nhất. Không bịa đặt dữ liệu.
+2. Nếu người dùng yêu cầu tóm tắt, hãy đọc dữ liệu hội thoại trong context và tóm tắt ngắn gọn, làm nổi bật ý chính.
+3. Nếu người dùng yêu cầu chia nhỏ công việc (Tạo task), hãy liệt kê các bước rõ ràng.
+4. Xưng hô là "Tôi" và gọi người dùng là "Bạn", dùng tiếng Việt tự nhiên, thân thiện.
+5. BẮT BUỘC TRẢ VỀ JSON VỚI 2 TRƯỜNG SAU:
+   - "reply": (String) Nội dung câu trả lời chi tiết của bạn.
+   - "suggestedActions": (Array of Strings) Mảng chứa TỐI ĐA 3 hành động gợi ý tiếp theo. Chỉ được chọn từ danh sách: ["CREATE_TASK", "SUMMARIZE", "FIND_TASK", "PRIORITIZE"]. Nếu không có hành động nào phù hợp, hãy để mảng rỗng [].`;
 
-      Cau hoi cua nguoi dung:
-      ${userMessage}
-
-      QUAN TRONG: Chi tra ve mot JSON object hop le, khong markdown, khong giai thich ngoai JSON.
-      Cau truc:
-      {
-        "reply": "Noi dung tra loi bang tieng Viet",
-        "suggestedActions": ["CREATE_TASK", "SUMMARIZE"]
-      }
-
-      suggestedActions chi duoc chon tu: CREATE_TASK, SUMMARIZE, FIND_TASK, PRIORITIZE.
-      Neu khong can goi y hanh dong thi tra ve mang rong.
-    `;
-
+    // 3. Gọi Gemini với cấu hình JSON Mode chuẩn xác
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: aiPrompt,
+      contents: userMessage,
+      config: {
+        systemInstruction: systemInstruction,
+        responseMimeType: "application/json", // VŨ KHÍ TỐI THƯỢNG: Ép Gemini luôn trả về JSON hợp lệ
+        temperature: 0.7, // Nhiệt độ 0.7 giúp AI sáng tạo nhưng vẫn giữ tính logic
+      }
     });
 
-    let rawText = response.text || '';
-    const startIndex = rawText.indexOf('{');
-    const endIndex = rawText.lastIndexOf('}');
-
-    if (startIndex !== -1 && endIndex !== -1) {
-      rawText = rawText.substring(startIndex, endIndex + 1);
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (parseError) {
-      parsed = {
-        reply: response.text || 'Toi chua tao duoc cau tra loi phu hop.',
-        suggestedActions: [],
-      };
-    }
+    // 4. Xử lý kết quả (Không cần cắt chuỗi thủ công nữa)
+    const rawText = response.text || '{}';
+    const parsed = JSON.parse(rawText);
 
     res.json({
-      reply: parsed.reply || 'Toi chua tao duoc cau tra loi phu hop.',
-      suggestedActions: Array.isArray(parsed.suggestedActions)
-        ? parsed.suggestedActions
-        : [],
+      reply: parsed.reply || 'Xin lỗi, tôi chưa thể tổng hợp được câu trả lời lúc này.',
+      suggestedActions: Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [],
     });
+
   } catch (error) {
-    console.error('Assistant error:', error);
+    console.error('Lỗi hệ thống Trợ lý AI:', error);
     res.status(500).json({
-      error: 'Tro ly AI dang ban, vui long thu lai sau!',
+      error: 'Trợ lý AI đang bận xử lý dữ liệu, vui lòng thử lại sau nhé!',
       details: error.message,
     });
   }
 });
+
 // 4. Bat cong tac cho Server chay
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
