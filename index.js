@@ -146,20 +146,17 @@ app.post('/api/assistant/chat', async (req, res) => {
       : 'Người dùng chưa cung cấp dữ liệu dự án.';
 
     // 2. Thiết lập "Nhân cách" và "Luật lệ" cho Trợ lý (System Instruction)
-    const systemInstruction = `Bạn là TaskHub AI, một trợ lý quản lý dự án thông minh, chuyên nghiệp và tận tâm.
-Nhiệm vụ của bạn là giúp người dùng quản lý công việc, phân tích tiến độ, và đưa ra lời khuyên.
+    const systemInstruction = `Bạn là TaskHub AI. 
+    Nhiệm vụ: Hỗ trợ người dùng quản lý dự án.
+    
+    DỮ LIỆU HỆ THỐNG CỦA NGƯỜI DÙNG:
+    ${contextString}
 
-DỮ LIỆU DỰ ÁN HIỆN TẠI CỦA NGƯỜI DÙNG:
-${contextString}
-
-QUY TẮC PHẢN HỒI (BẮT BUỘC TUÂN THỦ):
-1. Phân tích câu hỏi của người dùng và đối chiếu với "Dữ liệu dự án" để đưa ra câu trả lời chính xác, thực tế nhất. Không bịa đặt dữ liệu.
-2. Nếu người dùng yêu cầu tóm tắt, hãy đọc dữ liệu hội thoại trong context và tóm tắt ngắn gọn, làm nổi bật ý chính.
-3. Nếu người dùng yêu cầu chia nhỏ công việc (Tạo task), hãy liệt kê các bước rõ ràng.
-4. Xưng hô là "Tôi" và gọi người dùng là "Bạn", dùng tiếng Việt tự nhiên, thân thiện.
-5. BẮT BUỘC TRẢ VỀ JSON VỚI 2 TRƯỜNG SAU:
-   - "reply": (String) Nội dung câu trả lời chi tiết của bạn.
-   - "suggestedActions": (Array of Strings) Mảng chứa TỐI ĐA 3 hành động gợi ý tiếp theo. Chỉ được chọn từ danh sách: ["CREATE_TASK", "SUMMARIZE", "FIND_TASK", "PRIORITIZE"]. Nếu không có hành động nào phù hợp, hãy để mảng rỗng [].`;
+    HƯỚNG DẪN XỬ LÝ:
+    1. Nếu dữ liệu chứa "available_projects", hãy hiểu đó là danh sách các dự án người dùng đang tham gia (Ví dụ: Food Share). 
+    2. Khi người dùng hỏi về một dự án cụ thể, hãy xác nhận thông tin từ danh sách này.
+    3. Trả lời chuyên nghiệp, tập trung vào việc giải quyết công việc.
+    4. LUÔN TRẢ VỀ JSON: {"reply": "...", "suggestedActions": [...]}`;
 
     // 3. Gọi Gemini với cấu hình JSON Mode chuẩn xác
     const response = await ai.models.generateContent({
