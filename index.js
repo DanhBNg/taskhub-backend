@@ -4,6 +4,13 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { GoogleGenAI } = require('@google/genai');
+const {
+  ALLOWED_SUGGESTED_ACTIONS,
+  parseJsonFromText,
+  normalizeAssistantResponse,
+  normalizeGeneratedTasks,
+  normalizeTaskInsights,
+} = require('./assistantUtils');
 
 const serviceAccount = require('./serviceAccountKey.json');
 
@@ -17,161 +24,263 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ALLOWED_SUGGESTED_ACTIONS = [
-  'SUMMARIZE',
-  'CREATE_TASK',
-  'FIND_TASK',
-  'PRIORITIZE',
-];
+const db = admin.firestore();
 
-function normalizeSuggestedActions(actions) {
-  if (!Array.isArray(actions)) return [];
-
-  return actions
-    .map((action) => String(action || '').trim().toUpperCase())
-    .filter((action) => ALLOWED_SUGGESTED_ACTIONS.includes(action))
-    .filter((action, index, array) => array.indexOf(action) === index)
-    .slice(0, 4);
-}
-
-function parseJsonFromText(rawText, fallbackValue) {
-  if (!rawText || typeof rawText !== 'string') return fallbackValue;
-
+async function verifyFirebaseToken(req, res, next) {
   try {
-    return JSON.parse(rawText);
+    const authHeader = req.headers.authorization || '';
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+
+    if (!match) {
+      return res.status(401).json({ error: 'Missing Firebase ID token.' });
+    }
+
+    const decodedToken = await admin.auth().verifyIdToken(match[1]);
+    req.user = decodedToken;
+    return next();
   } catch (error) {
-    const firstObject = rawText.indexOf('{');
-    const lastObject = rawText.lastIndexOf('}');
-    const firstArray = rawText.indexOf('[');
-    const lastArray = rawText.lastIndexOf(']');
-
-    const canReadObject =
-      firstObject !== -1 && lastObject !== -1 && lastObject > firstObject;
-    const canReadArray =
-      firstArray !== -1 && lastArray !== -1 && lastArray > firstArray;
-
-    if (canReadArray && (!canReadObject || firstArray < firstObject)) {
-      return JSON.parse(rawText.substring(firstArray, lastArray + 1));
-    }
-
-    if (canReadObject) {
-      return JSON.parse(rawText.substring(firstObject, lastObject + 1));
-    }
-
-    throw error;
+    console.error('Admin token verification failed:', error);
+    return res.status(401).json({ error: 'Invalid or expired token.' });
   }
 }
 
-function normalizeAssistantResponse(rawText) {
-  const parsed = parseJsonFromText(rawText, {});
+async function requireSystemAdmin(req, res, next) {
+  try {
+    const userDoc = await db.collection('USERS').doc(req.user.uid).get();
 
+    if (!userDoc.exists) {
+      return res.status(403).json({ error: 'User profile was not found.' });
+    }
+
+    const systemRole = String(userDoc.data().systemRole || '').toLowerCase();
+    if (systemRole !== 'admin') {
+      return res.status(403).json({ error: 'This account does not have system admin permission.' });
+    }
+
+    req.adminProfile = { id: userDoc.id, ...userDoc.data() };
+    return next();
+  } catch (error) {
+    console.error('Admin permission check failed:', error);
+    return res.status(500).json({ error: 'Cannot verify admin permission.' });
+  }
+}
+
+function toIsoDate(value) {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate().toISOString();
+  if (value instanceof Date) return value.toISOString();
+  return null;
+}
+
+function normalizeLimit(rawLimit, fallback = 100, max = 500) {
+  const parsed = Number.parseInt(rawLimit, 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function mapUserDoc(doc) {
+  const data = doc.data() || {};
   return {
-    reply: typeof parsed.reply === 'string' ? parsed.reply.trim() : '',
-    suggestedActions: normalizeSuggestedActions(parsed.suggestedActions),
+    id: doc.id,
+    email: data.email || '',
+    fullName: data.fullName || '',
+    avatarUrl: data.avatarUrl || '',
+    systemRole: data.systemRole || 'user',
+    createdAt: toIsoDate(data.createdAt),
   };
 }
 
-function normalizeGeneratedTasks(rawTasks) {
-  if (!Array.isArray(rawTasks)) return [];
-
-  return rawTasks
-    .slice(0, 5)
-    .map((task) => ({
-      title: String(task.title || '').trim(),
-      description: String(task.description || '').trim(),
-      priority: ['High', 'Medium', 'Low'].includes(task.priority)
-        ? task.priority
-        : 'Medium',
-    }))
-    .filter((task) => task.title.length > 0);
+function mapProjectDoc(doc) {
+  const data = doc.data() || {};
+  const memberIds = Array.isArray(data.memberIds) ? data.memberIds : [];
+  return {
+    id: doc.id,
+    name: data.name || '',
+    description: data.description || '',
+    ownerId: data.ownerId || '',
+    memberCount: memberIds.length,
+    memberIds,
+    roles: data.roles || {},
+    status: data.status || 'active',
+    createdAt: toIsoDate(data.createdAt),
+  };
 }
 
-function normalizeTaskInsights(rawTasks) {
-  if (!Array.isArray(rawTasks)) return [];
-
-  return rawTasks
-    .slice(0, 8)
-    .map((task, index) => ({
-      title: String(task.title || task.taskName || '').trim(),
-      projectName: String(task.projectName || '').trim(),
-      status: String(task.status || '').trim(),
-      priority: String(task.priority || '').trim(),
-      dueDate: String(task.dueDate || '').trim(),
-      reason: String(task.reason || task.matchReason || '').trim(),
-      rank: Number.isInteger(task.rank) ? task.rank : index + 1,
-    }))
-    .filter((task) => task.title.length > 0);
+function mapTaskDoc(doc) {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    projectId: data.projectId || '',
+    title: data.title || '',
+    description: data.description || '',
+    status: data.status || 'todo',
+    priority: data.priority || 'Medium',
+    assigneeIds: Array.isArray(data.assigneeIds) ? data.assigneeIds : [],
+    assigneeNames: Array.isArray(data.assigneeNames) ? data.assigneeNames : [],
+    dueDate: toIsoDate(data.dueDate),
+    createdAt: toIsoDate(data.createdAt),
+  };
 }
+
+const adminRouter = express.Router();
+adminRouter.use(verifyFirebaseToken, requireSystemAdmin);
+
+adminRouter.get('/stats', async (req, res) => {
+  try {
+    const [usersSnap, projectsSnap, tasksSnap, messagesSnap] = await Promise.all([
+      db.collection('USERS').count().get(),
+      db.collection('PROJECTS').count().get(),
+      db.collection('TASKS').count().get(),
+      db.collection('MESSAGES').count().get(),
+    ]);
+
+    res.json({
+      users: usersSnap.data().count,
+      projects: projectsSnap.data().count,
+      tasks: tasksSnap.data().count,
+      messages: messagesSnap.data().count,
+    });
+  } catch (error) {
+    console.error('Failed to load admin stats:', error);
+    res.status(500).json({ error: 'Cannot load system stats.' });
+  }
+});
+
+adminRouter.get('/users', async (req, res) => {
+  try {
+    const limit = normalizeLimit(req.query.limit);
+    const snapshot = await db.collection('USERS').orderBy('createdAt', 'desc').limit(limit).get();
+    res.json({ users: snapshot.docs.map(mapUserDoc) });
+  } catch (error) {
+    console.error('Failed to load users:', error);
+    res.status(500).json({ error: 'Cannot load users.' });
+  }
+});
+
+adminRouter.get('/projects', async (req, res) => {
+  try {
+    const limit = normalizeLimit(req.query.limit);
+    const snapshot = await db.collection('PROJECTS').orderBy('createdAt', 'desc').limit(limit).get();
+    res.json({ projects: snapshot.docs.map(mapProjectDoc) });
+  } catch (error) {
+    console.error('Failed to load projects:', error);
+    res.status(500).json({ error: 'Cannot load projects.' });
+  }
+});
+
+adminRouter.get('/tasks', async (req, res) => {
+  try {
+    const limit = normalizeLimit(req.query.limit, 150, 500);
+    const snapshot = await db.collection('TASKS').orderBy('createdAt', 'desc').limit(limit).get();
+    res.json({ tasks: snapshot.docs.map(mapTaskDoc) });
+  } catch (error) {
+    console.error('Failed to load tasks:', error);
+    res.status(500).json({ error: 'Cannot load tasks.' });
+  }
+});
+
+adminRouter.patch('/users/:uid/role', async (req, res) => {
+  try {
+    const role = String(req.body.systemRole || '').trim().toLowerCase();
+    if (!['admin', 'user'].includes(role)) {
+      return res.status(400).json({ error: 'systemRole must be admin or user.' });
+    }
+
+    await db.collection('USERS').doc(req.params.uid).update({ systemRole: role });
+    res.json({ success: true, userId: req.params.uid, systemRole: role });
+  } catch (error) {
+    console.error('Failed to update user role:', error);
+    res.status(500).json({ error: 'Cannot update user role.' });
+  }
+});
+
+adminRouter.patch('/projects/:projectId/status', async (req, res) => {
+  try {
+    const status = String(req.body.status || '').trim().toLowerCase();
+    if (!['active', 'archived'].includes(status)) {
+      return res.status(400).json({ error: 'status must be active or archived.' });
+    }
+
+    await db.collection('PROJECTS').doc(req.params.projectId).update({ status });
+    res.json({ success: true, projectId: req.params.projectId, status });
+  } catch (error) {
+    console.error('Failed to update project status:', error);
+    res.status(500).json({ error: 'Cannot update project status.' });
+  }
+});
+
+app.use('/api/admin', adminRouter);
+
 
 function buildAssistantActionInstruction(action, contextString, historyString) {
   if (action === 'CREATE_TASK') {
-    return `Ban la TaskHub AI, tro ly quan ly du an cong nghe.
+    return `Bạn là TaskHub AI, trợ lý quản lý dự án công nghệ.
 
-DU LIEU HE THONG:
+DỮ LIỆU HỆ THỐNG:
 ${contextString}
 
-LICH SU HOI THOAI GAN DAY:
+LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
 ${historyString}
 
-Nhiem vu: De xuat cac task moi co the tao dua tren du lieu tren.
-Quy tac:
-- Chi dua tren context va lich su hoi thoai duoc cung cap. Neu thieu du lieu, tra ve mang tasks rong va noi ro ly do trong "reply".
-- Khong bia deadline, nguoi thuc hien, trang thai hoac ten du an.
-- Moi task can ro rang, co the thuc hien duoc, uu tien 1 den 5 task.
-- priority chi duoc la "High", "Medium" hoac "Low".
-- Luon tra ve JSON hop le dung cau truc: {"reply":"...","tasks":[{"title":"...","description":"...","priority":"Medium"}]}. Khong boc markdown.`;
+Nhiệm vụ: Đề xuất các task mới có thể tạo dựa trên dữ liệu trên.
+Quy tắc:
+- Chỉ dựa trên context và lịch sử hội thoại được cung cấp. Nếu thiếu dữ liệu, trả về mảng tasks rỗng và nói rõ lý do trong "reply".
+- Không bịa deadline, người thực hiện, trạng thái hoặc tên dự án.
+- Mỗi task cần rõ ràng, có thể thực hiện được, ưu tiên 1 đến 5 task.
+- priority chỉ được là "High", "Medium" hoặc "Low".
+- Luôn trả về JSON hợp lệ đúng cấu trúc: {"reply":"...","tasks":[{"title":"...","description":"...","priority":"Medium"}]}. Không bọc markdown.`;
   }
 
   if (action === 'FIND_TASK') {
-    return `Ban la TaskHub AI, tro ly quan ly du an cong nghe.
+    return `Bạn là TaskHub AI, trợ lý quản lý dự án công nghệ.
 
-DU LIEU HE THONG:
+DỮ LIỆU HỆ THỐNG:
 ${contextString}
 
-LICH SU HOI THOAI GAN DAY:
+LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
 ${historyString}
 
-Nhiem vu: Tim cac task phu hop nhat voi nhu cau gan day cua nguoi dung.
-Quy tac:
-- Chi tim trong "all_tasks_list" hoac "task" duoc cung cap, khong bia task.
-- Neu khong co task phu hop hoac thieu du lieu, tra ve tasks rong va noi ro ly do trong "reply".
-- Uu tien task trung voi ten, du an, trang thai, deadline, priority hoac noi dung nguoi dung vua hoi.
-- Tra ve toi da 8 task.
-- Luon tra ve JSON hop le dung cau truc: {"reply":"...","tasks":[{"title":"...","projectName":"...","status":"...","priority":"...","dueDate":"...","reason":"..."}]}. Khong boc markdown.`;
+Nhiệm vụ: Tìm các task phù hợp nhất với nhu cầu gần đây của người dùng.
+Quy tắc:
+- Chỉ tìm trong "all_tasks_list" hoặc "task" được cung cấp, không bịa task.
+- Nếu không có task phù hợp hoặc thiếu dữ liệu, trả về tasks rỗng và nói rõ lý do trong "reply".
+- Ưu tiên task trùng với tên, dự án, trạng thái, deadline, priority hoặc nội dung người dùng vừa hỏi.
+- Trả về tối đa 8 task.
+- Luôn trả về JSON hợp lệ đúng cấu trúc: {"reply":"...","tasks":[{"title":"...","projectName":"...","status":"...","priority":"...","dueDate":"...","reason":"..."}]}. Không bọc markdown.`;
   }
 
   if (action === 'PRIORITIZE') {
-    return `Ban la TaskHub AI, tro ly quan ly du an cong nghe.
+    return `Bạn là TaskHub AI, trợ lý quản lý dự án công nghệ.
 
-DU LIEU HE THONG:
+DỮ LIỆU HỆ THỐNG:
 ${contextString}
 
-LICH SU HOI THOAI GAN DAY:
+LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
 ${historyString}
 
-Nhiem vu: Sap xep cac task nen uu tien xu ly truoc.
-Quy tac:
-- Chi dua tren "all_tasks_list" hoac "task" duoc cung cap, khong bia task.
-- Uu tien theo deadline gan/qua han, priority cao, task dang lam, task co rui ro chan tien do.
-- Neu thieu du lieu de xep hang, tra ve prioritizedTasks rong va noi ro ly do trong "reply".
-- Tra ve toi da 8 task, co "rank" va "reason" ngan gon.
-- Luon tra ve JSON hop le dung cau truc: {"reply":"...","prioritizedTasks":[{"rank":1,"title":"...","projectName":"...","status":"...","priority":"...","dueDate":"...","reason":"..."}]}. Khong boc markdown.`;
+Nhiệm vụ: Sắp xếp các task nên ưu tiên xử lý trước.
+Quy tắc:
+- Chỉ dựa trên "all_tasks_list" hoặc "task" được cung cấp, không bịa task.
+- Ưu tiên theo deadline gần/quá hạn, priority cao, task đang làm, task có rủi ro chặn tiến độ.
+- Nếu thiếu dữ liệu để xếp hạng, trả về prioritizedTasks rỗng và nói rõ lý do trong "reply".
+- Trả về tối đa 8 task, có "rank" và "reason" ngắn gọn.
+- Luôn trả về JSON hợp lệ đúng cấu trúc: {"reply":"...","prioritizedTasks":[{"rank":1,"title":"...","projectName":"...","status":"...","priority":"...","dueDate":"...","reason":"..."}]}. Không bọc markdown.`;
   }
 
-  return `Ban la TaskHub AI, tro ly quan ly du an cong nghe.
+  return `Bạn là TaskHub AI, trợ lý quản lý dự án công nghệ.
 
-DU LIEU HE THONG:
+DỮ LIỆU HỆ THỐNG:
 ${contextString}
 
-LICH SU HOI THOAI GAN DAY:
+LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
 ${historyString}
 
-Nhiem vu: Tom tat noi dung quan trong tu du lieu tren.
-Quy tac:
-- Chi dua tren context va lich su hoi thoai duoc cung cap.
-- Neu thieu du lieu, noi ro chua du du lieu, khong bia thong tin.
-- Tap trung vao van de da thao luan, quyet dinh, viec can lam tiep theo.
-- Luon tra ve JSON hop le dung cau truc: {"summary":"..."}. Khong boc markdown.`;
+Nhiệm vụ: Tóm tắt nội dung quan trọng từ dữ liệu trên.
+Quy tắc:
+- Chỉ dựa trên context và lịch sử hội thoại được cung cấp.
+- Nếu thiếu dữ liệu, nói rõ chưa đủ dữ liệu, không bịa thông tin.
+- Tập trung vào vấn đề đã thảo luận, quyết định, việc cần làm tiếp theo.
+- Luôn trả về JSON hợp lệ đúng cấu trúc: {"summary":"..."}. Không bọc markdown.`;
 }
 
 function buildAssistantSystemInstruction(contextString, historyString) {
@@ -310,27 +419,27 @@ app.post('/api/assistant/action', async (req, res) => {
     const normalizedAction = String(action || '').trim().toUpperCase();
 
     if (!ALLOWED_SUGGESTED_ACTIONS.includes(normalizedAction)) {
-      return res.status(400).json({ error: 'Hanh dong khong hop le.' });
+      return res.status(400).json({ error: 'Hành động không hợp lệ.' });
     }
 
     const contextString = context && Object.keys(context).length > 0
       ? JSON.stringify(context, null, 2)
-      : 'Nguoi dung chua cung cap du lieu du an.';
+      : 'Người dùng chưa cung cấp dữ liệu dự án.';
 
     const historyString = Array.isArray(conversationHistory) && conversationHistory.length > 0
       ? conversationHistory
           .slice(-8)
-          .map((item) => `${item.role === 'user' ? 'Nguoi dung' : 'TaskHub AI'}: ${item.content}`)
+          .map((item) => `${item.role === 'user' ? 'Người dùng' : 'TaskHub AI'}: ${item.content}`)
           .join('\n')
-      : 'Chua co lich su hoi thoai truoc do.';
+      : 'Chưa có lịch sử hội thoại trước đó.';
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: {
-        SUMMARIZE: 'Tom tat noi dung hien tai.',
-        CREATE_TASK: 'De xuat danh sach task moi co the tao.',
-        FIND_TASK: 'Tim cac task phu hop nhat.',
-        PRIORITIZE: 'Sap xep cac task nen uu tien xu ly.',
+        SUMMARIZE: 'Tóm tắt nội dung hiện tại.',
+        CREATE_TASK: 'Đề xuất danh sách task mới có thể tạo.',
+        FIND_TASK: 'Tìm các task phù hợp nhất.',
+        PRIORITIZE: 'Sắp xếp các task nên ưu tiên xử lý.',
       }[normalizedAction],
       config: {
         systemInstruction: buildAssistantActionInstruction(
@@ -350,7 +459,7 @@ app.post('/api/assistant/action', async (req, res) => {
         action: normalizedAction,
         reply: typeof parsed.reply === 'string'
           ? parsed.reply.trim()
-          : 'Toi da tim cac task phu hop nhat tu du lieu hien co.',
+          : 'Tôi đã tìm các task phù hợp nhất từ dữ liệu hiện có.',
         tasks: normalizeTaskInsights(parsed.tasks),
         projectId: projectId || '',
       });
@@ -361,7 +470,7 @@ app.post('/api/assistant/action', async (req, res) => {
         action: normalizedAction,
         reply: typeof parsed.reply === 'string'
           ? parsed.reply.trim()
-          : 'Toi da sap xep cac task nen uu tien tu du lieu hien co.',
+          : 'Tôi đã sắp xếp các task nên ưu tiên từ dữ liệu hiện có.',
         prioritizedTasks: normalizeTaskInsights(parsed.prioritizedTasks),
         projectId: projectId || '',
       });
@@ -372,7 +481,7 @@ app.post('/api/assistant/action', async (req, res) => {
         action: normalizedAction,
         reply: typeof parsed.reply === 'string'
           ? parsed.reply.trim()
-          : 'Toi da de xuat mot so task co the tao.',
+          : 'Tôi đã đề xuất một số task có thể tạo.',
         tasks: normalizeGeneratedTasks(parsed.tasks),
         projectId: projectId || '',
       });
@@ -382,13 +491,13 @@ app.post('/api/assistant/action', async (req, res) => {
       action: normalizedAction,
       summary: typeof parsed.summary === 'string'
         ? parsed.summary.trim()
-        : 'Chua du du lieu de tom tat.',
+        : 'Chưa đủ dữ liệu để tóm tắt.',
       projectId: projectId || '',
     });
   } catch (error) {
-    console.error('Loi he thong Assistant action:', error);
+    console.error('Lỗi hệ thống Assistant action:', error);
     res.status(500).json({
-      error: 'Tro ly AI dang ban xu ly hanh dong, vui long thu lai sau nhe!',
+      error: 'Trợ lý AI đang bận xử lý hành động, vui lòng thử lại sau nhé!',
       details: error.message,
     });
   }
@@ -445,6 +554,10 @@ app.post('/api/assistant/chat', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`TaskHub AI Backend is running at http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`TaskHub AI Backend is running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

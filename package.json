@@ -4,7 +4,12 @@
   "description": "Backend API for TaskHub AI",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "jest --runInBand",
+    "test:verbose": "jest --runInBand --verbose",
+    "test:coverage": "jest --runInBand --verbose --coverage --coverageDirectory ../taskhub_ai/.tmp/backend-coverage",
+    "test:api": "jest test/assistantApi.test.js --runInBand --verbose",
+    "test:unit": "jest test/assistantUtils.test.js --runInBand --verbose"
   },
   "dependencies": {
     "@google/genai": "^1.50.0",
@@ -12,5 +17,9 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "firebase-admin": "^13.8.0"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0",
+    "supertest": "^7.1.4"
   }
 }
